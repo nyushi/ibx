@@ -107,4 +107,6 @@ From the repository root:
 python3 -m unittest discover -s tests -v
 ```
 
-TODO: choose a license
+## License
+
+MIT License. See [LICENSE](LICENSE).
