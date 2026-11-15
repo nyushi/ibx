@@ -33,8 +33,9 @@ Existing directory permissions are preserved.
   expires (default 5m). Commands run through `sh -c`, receiving `IBX_BOX`,
   `IBX_ID`, and `IBX_PENDING` in the environment, never the body.
   `--notify-timeout SEC` defaults to 10 seconds. Failure clears the marker.
-- `gc [--keep DUR]` removes done message files older than 7d by default and
-  tmp files older than one hour, using modification times. It prints just
+- `gc [--keep DUR]` removes done message files taken more than 7d ago by
+  default (aged by file change time, which the move into done updates) and
+  tmp files older than one hour by modification time. It prints just
   the removal count and leaves other directories untouched.
 
 ```sh

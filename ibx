@@ -249,7 +249,11 @@ def main(argv=None):
             for name, age in (('done', args.keep), ('tmp', 3600)):
                 for path in (box / name).iterdir():
                     try:
-                        if path.is_file() and (name == 'tmp' or path.name.endswith('.msg')) and now - path.stat().st_mtime > age:
+                        stat = path.stat()
+                        # done/ ages from when the message was taken (the
+                        # rename updates the change time); tmp/ from writing.
+                        stamp = stat.st_ctime if name == 'done' else stat.st_mtime
+                        if path.is_file() and (name == 'tmp' or path.name.endswith('.msg')) and now - stamp > age:
                             path.unlink()
                             count += 1
                     except FileNotFoundError:

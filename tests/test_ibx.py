@@ -181,16 +181,29 @@ module.main(['--box', sys.argv[2], 'put', 'body'])
         self.assertEqual(len(list((self.box / 'pending').iterdir())), 2)
 
     def test_gc(self):
-        self.put()
+        # gc ages done/ files by change time (when they were taken), not by
+        # modification time: a message that waited long in pending but was
+        # taken just now must survive.
+        self.put(ident='stale')
+        os.utime(self.box / 'pending/stale.msg', (1, 1))
         self.run_cli('take')
         self.put(ident='pending')
         for name in ('done/old.msg', 'tmp/old', 'tmp/new', 'state/other'):
             (self.box / name).write_bytes(b'body')
-        for name in ('done/old.msg', 'tmp/old', 'pending/pending.msg', 'state/other'):
+        for name in ('tmp/old', 'pending/pending.msg', 'state/other'):
             os.utime(self.box / name, (1, 1))
-        self.assertEqual(self.run_cli('gc', '--keep', '1h').stdout, b'2\n')
-        for name in ('done/item.msg', 'tmp/new', 'pending/pending.msg', 'state/other'):
-            self.assertTrue((self.box / name).exists())
+        self.assertEqual(self.run_cli('gc', '--keep', '1h').stdout, b'1\n')
+        for name in ('done/stale.msg', 'done/old.msg', 'tmp/new', 'pending/pending.msg', 'state/other'):
+            self.assertTrue((self.box / name).exists(), name)
+        self.assertFalse((self.box / 'tmp/old').exists())
+        # With a zero keep period, done/ files taken in the past are removed.
+        # tmp/ always uses its own one-hour threshold, and pending/ and
+        # state/ are never touched.
+        self.assertEqual(self.run_cli('gc', '--keep', '0').stdout, b'2\n')
+        for name in ('done/stale.msg', 'done/old.msg'):
+            self.assertFalse((self.box / name).exists(), name)
+        for name in ('tmp/new', 'pending/pending.msg', 'state/other'):
+            self.assertTrue((self.box / name).exists(), name)
 
     def test_permissions_bytes_and_reuse(self):
         self.put(b'raw\xff')
