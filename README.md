@@ -1,12 +1,19 @@
 # ibx
 
 ibx is a daemonless directory inbox for scripts and agents. It stores message
-bytes before issuing an optional notification. It requires Python 3.9+ and a
-local Unix-like filesystem, with no third-party packages.
+bytes before issuing an optional notification. It requires a local Unix-like filesystem. Build with Go 1.23 or later;
+there are no third-party dependencies.
 
 ## Install
 
-Copy `ibx` to a directory on your command search path and run `chmod +x ibx`.
+Install with Go:
+
+```sh
+go install github.com/nyushi/ibx@latest
+```
+
+Or build from the source directory with `go build -o ibx .` and copy the
+resulting binary to a directory on your command search path.
 
 ## Commands
 
@@ -104,7 +111,7 @@ No claims are made about other directory-queue libraries.
 From the repository root:
 
 ```sh
-python3 -m unittest discover -s tests -v
+go test ./...
 ```
 
 ## License
