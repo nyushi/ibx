@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""A directory inbox with atomic publication and coalesced hints."""
+import argparse
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+
+def duration(value):
+    match = re.fullmatch(r'(\d+(?:\.\d*)?|\.\d+)([smhd]?)', value)
+    if not match:
+        raise argparse.ArgumentTypeError('expected a nonnegative duration')
+    result = float(match[1]) * {'': 1, 's': 1, 'm': 60, 'h': 3600, 'd': 86400}[match[2]]
+    if result == float('inf'):
+        raise argparse.ArgumentTypeError('duration is too large')
+    return result
+
+
+def seconds(value):
+    try:
+        result = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError('expected nonnegative seconds')
+    if not 0 <= result < float('inf'):
+        raise argparse.ArgumentTypeError('expected finite nonnegative seconds')
+    return result
+
+
+def positive(value):
+    try:
+        result = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError('expected a positive integer')
+    if result <= 0:
+        raise argparse.ArgumentTypeError('expected a positive integer')
+    return result
+
+
+def parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument('--box', default=argparse.SUPPRESS)
+    common.add_argument('--format', choices=('tsv', 'json'), default=argparse.SUPPRESS)
+    root = argparse.ArgumentParser(description=__doc__, parents=[common])
+    commands = root.add_subparsers(dest='command', required=True)
+    for name in ('put', 'take', 'list', 'wait', 'stream', 'send', 'gc'):
+        command = commands.add_parser(name, parents=[common])
+        if name in ('put', 'send'):
+            command.add_argument('--id')
+            command.add_argument('--max-size', type=positive, default=1024 * 1024)
+            command.add_argument('body', nargs='?')
+        if name in ('take', 'wait'):
+            command.add_argument('--max', type=positive)
+        if name == 'list':
+            command.add_argument('--done', action='store_true')
+            command.add_argument('--since', type=duration)
+        if name in ('wait', 'stream'):
+            command.add_argument('--poll', type=seconds, default=1)
+        if name == 'wait':
+            command.add_argument('--timeout', type=seconds)
+        if name == 'send':
+            command.add_argument('--notify-cmd', default=os.environ.get('IBX_NOTIFY_CMD', ''))
+            command.add_argument('--renotify-after', type=duration, default=300)
+            command.add_argument('--notify-timeout', type=seconds, default=10)
+        if name == 'gc':
+            command.add_argument('--keep', type=duration, default=7 * 86400)
+    return root
+
+
+def setup(box):
+    box.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for name in ('tmp', 'pending', 'done', 'state'):
+        (box / name).mkdir(mode=0o700, exist_ok=True)
+
+
+def unlink(path):
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+@contextmanager
+def locked(directory):
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def put(box, args, usage):
+    if args.id is not None and not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}', args.id):
+        usage.error('invalid id')
+    if args.body is None or args.body == '-':
+        body = sys.stdin.buffer.read(args.max_size + 1)
+    else:
+        body = os.fsencode(args.body)
+    if not body or len(body) > args.max_size:
+        usage.error('body is empty or exceeds maximum size')
+    ident = args.id if args.id is not None else hashlib.sha256(body).hexdigest()[:16]
+    fd, name = tempfile.mkstemp(dir=box / 'tmp')
+    try:
+        with os.fdopen(fd, 'wb') as file:
+            file.write(body)
+            file.flush()
+            os.fsync(file.fileno())
+        try:
+            with locked(box / 'pending'):
+                os.link(name, box / 'pending' / (ident + '.msg'))
+        except FileExistsError:
+            print('duplicate', file=sys.stderr)
+    finally:
+        unlink(Path(name))
+    print(ident, flush=True)
+    return ident
+
+
+def entries(directory):
+    result = []
+    for path in directory.iterdir():
+        if not path.name.endswith('.msg') or not path.is_file():
+            continue
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            continue
+        result.append((stat.st_mtime_ns, path.stem, path, stat.st_ctime))
+    return sorted(result)
+
+
+def output(ident, body, fmt):
+    body = body.decode('utf-8', errors='replace')
+    if fmt == 'json':
+        line = json.dumps({'id': ident, 'body': body}, ensure_ascii=True)
+    else:
+        body = body.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+        line = ident + '\t' + body
+    sys.stdout.write(line + '\n')
+    sys.stdout.flush()
+
+
+def take(box, fmt, maximum=None):
+    unlink(box / 'state/notified')
+    count = 0
+    for _, ident, path, _ in entries(box / 'pending'):
+        if maximum is not None and count >= maximum:
+            break
+        try:
+            # Keep the claimed inode open even if another generation replaces done.
+            with locked(box / 'pending'):
+                with path.open('rb') as file:
+                    os.rename(path, box / 'done' / path.name)
+                    body = file.read()
+        except FileNotFoundError:
+            continue
+        output(ident, body, fmt)
+        count += 1
+    return count
+
+
+def notify(box, args, ident):
+    if not args.notify_cmd:
+        return 0
+    marker = box / 'state/notified'
+    try:
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        try:
+            if time.time() - marker.stat().st_mtime < args.renotify_after:
+                return 0
+            os.utime(marker, None)
+        except FileNotFoundError:
+            return notify(box, args, ident)
+    else:
+        os.close(fd)
+    env = os.environ.copy()
+    env.update(IBX_BOX=str(box), IBX_ID=ident, IBX_PENDING=str(len(entries(box / 'pending'))))
+    failed = False
+    try:
+        process = subprocess.Popen(['sh', '-c', args.notify_cmd], env=env, start_new_session=True)
+        try:
+            failed = process.wait(timeout=args.notify_timeout) != 0
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            failed = True
+    except OSError:
+        failed = True
+    if failed:
+        unlink(marker)
+        print('warning: stored, notification failed', file=sys.stderr)
+        return 3
+    return 0
+
+
+def main(argv=None):
+    usage = parser()
+    args = usage.parse_args(argv)
+    location = getattr(args, 'box', None) or os.environ.get('IBX_BOX')
+    if not location:
+        usage.error('a box is required')
+    if args.command == 'list' and args.since is not None and not args.done:
+        usage.error('--since requires --done')
+    box = Path(location).absolute()
+    fmt = getattr(args, 'format', 'tsv')
+    try:
+        setup(box)
+        if args.command in ('put', 'send'):
+            ident = put(box, args, usage)
+            return notify(box, args, ident) if args.command == 'send' else 0
+        if args.command == 'take':
+            take(box, fmt, args.max)
+        elif args.command == 'list':
+            cutoff = time.time() - args.since if args.since is not None else None
+            for _, ident, path, changed in entries(box / ('done' if args.done else 'pending')):
+                if cutoff is not None and changed < cutoff:
+                    continue
+                try:
+                    body = path.read_bytes()
+                except FileNotFoundError:
+                    continue
+                output(ident, body, fmt)
+        elif args.command == 'wait':
+            deadline = None if args.timeout is None else time.monotonic() + args.timeout
+            while True:
+                if entries(box / 'pending') and take(box, fmt, args.max):
+                    return 0
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return 4
+                time.sleep(args.poll if remaining is None else min(args.poll, remaining))
+        elif args.command == 'stream':
+            while True:
+                take(box, fmt)
+                time.sleep(args.poll)
+        elif args.command == 'gc':
+            now = time.time()
+            count = 0
+            for name, age in (('done', args.keep), ('tmp', 3600)):
+                for path in (box / name).iterdir():
+                    try:
+                        if path.is_file() and (name == 'tmp' or path.name.endswith('.msg')) and now - path.stat().st_mtime > age:
+                            path.unlink()
+                            count += 1
+                    except FileNotFoundError:
+                        pass
+            print(count)
+        return 0
+    except BrokenPipeError:
+        # Avoid a second flush failure during interpreter shutdown.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        return 0 if args.command == 'stream' else 1
+    except (OSError, RuntimeError) as error:
+        print('error: ' + str(error), file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
