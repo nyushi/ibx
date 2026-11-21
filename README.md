@@ -1,8 +1,8 @@
 # ibx
 
-ibx is a daemonless directory inbox for scripts and agents. It stores message
-bytes before issuing an optional notification. It requires a local Unix-like filesystem. Build with Go 1.23 or later;
-there are no third-party dependencies.
+ibx is a Linux directory inbox for scripts and agents. Its client and daemon
+share one binary. Messages, owners, and reservations live in files on a local
+filesystem. Build with Go 1.23 or later. There are no third-party dependencies.
 
 ## Install
 
@@ -15,10 +15,35 @@ go install github.com/nyushi/ibx@latest
 Or build from the source directory with `go build -o ibx .` and copy the
 resulting binary to a directory on your command search path.
 
+## Daemon
+
+A daemon serves one root. Use `--root DIR` or set `IBX_ROOT` to select it.
+With neither, the root is the directory containing the resolved box, or the
+working directory for root-wide commands without a box. The default socket is
+`<root>/ibx.sock`. Set `IBX_SOCKET` to override it. Its directory must be
+owned by the daemon user, its mode is 0600, and the daemon checks the peer's
+UID. Clients and daemons must have matching binary and protocol versions.
+
+- `ibx daemon` runs in the foreground. Starting a second daemon on a live
+  socket fails. A dead daemon's stale socket is replaced when the next daemon starts.
+- Most clients start a detached daemon on demand and wait up to about five
+  seconds for it. Startup output is appended to `<root>/daemon.log`.
+  Set `IBX_AUTOSTART=0` to require a daemon to be running already.
+- `ibx daemon stop` and `ibx daemon restart` drain active commands before
+  stopping or replacing the daemon. Long-running `wait`, `stream`, and
+  batch input connections may be closed during either operation.
+- `ibx status` prints the daemon version, RFC 3339 start time, box count,
+  and job definition count. It exits 1 when stopped and never autostarts.
+  The box count excludes archived boxes. Job execution is planned for stage 3.
+
 ## Commands
 
-Select a box with `--box DIR` or `IBX_BOX`. Common options work before or
-after the command. New directories have mode 0700; files have mode 0600.
+Select a box with `--box DIR` or `IBX_BOX`. With `IBX_ROOT` set, relative
+box paths resolve against the root. `put` accepts a first positional box
+path containing a slash, and `send` accepts a positional box path. For
+example, `ibx send case/x/box` reads its body from stdin. With `IBX_ROOT` unset, relative box paths resolve
+against the caller's working directory. Common options work before or after
+the command. New directories have mode 0700 and files have mode 0600.
 Existing directory permissions are preserved.
 
 - `put [--id ID] [--max-size BYTES] [BODY | -]` stores a body and prints its id.
@@ -29,25 +54,161 @@ Existing directory permissions are preserved.
 - `take [--max N] [--as NAME] [--hold]` moves pending messages into done
   (or into holding with `--hold`, see below) and prints them, ordered
   by modification time in nanoseconds, then id. An empty inbox succeeds.
-- `list [--done] [--since DUR] [--holding]` prints without taking. `--since` requires
-  `--done` and filters by file change time. `--done` and `--holding`
-  cannot be combined. Ordering matches take.
+- `list [--holding | --done [--since DUR] | --scheduled] [--json]` prints
+  without taking. The default lists pending messages. `--since` filters done
+  entries by file change time. Scheduled output is id, delivery time, and
+  first line, sorted by delivery time and then storage order.
 - `wait [--timeout SEC] [--poll SEC] [--max N]` takes on arrival. Default
   polling is every second; without a timeout it waits indefinitely.
-- `stream [--poll SEC] [--as NAME]` repeats take, flushing each message,
-  until writing detects a closed output pipe. With `--as` it also ends
-  when ownership is lost (see Ownership).
-- `send` accepts put options and stores before notifying. `--notify-cmd CMD`
-  overrides `IBX_NOTIFY_CMD`; an empty command disables notification.
-  Hints coalesce until take clears the marker or `--renotify-after DUR`
-  expires (default 5m). Commands run through `sh -c`, receiving `IBX_BOX`,
-  `IBX_ID`, and `IBX_PENDING` in the environment, never the body.
-  `--notify-timeout SEC` defaults to 10 seconds. Failure clears the marker.
-- `gc [--keep DUR]` removes done message files taken more than 7d ago by
-  default (aged by file change time, which the move into done updates) and
-  tmp files older than one hour by modification time. It prints just
-  the removal count and leaves other directories untouched. Held
-  messages (below) are never removed by gc.
+- `stream [--poll SEC] [--as NAME] [--headers]` repeats take until writing
+  detects a closed output pipe. `--headers` prints only the id and escaped
+  first line, separated by a tab. With `--as` the stream also ends when
+  ownership is lost (see Ownership).
+- `gc [--keep DUR]` removes done messages older than the configured root
+  `keep` duration (default 7d), along with their metadata when no other live
+  entry shares the id. The existing `--keep` option overrides the config for
+  that run. Done age uses the file change time updated by the move into done.
+  GC also removes tmp files older than one hour. It prints the number of
+  removed message and tmp files. Held and scheduled messages are retained.
+
+## Sending
+
+`send` stores before notifying and prints the id of each stored message.
+An immediate single send without an explicit id keeps the usual
+16-character SHA-256 body id. `--id-from-body` uses that same hash of the
+exact body bytes in any single or plain line send. It conflicts with
+`--id`. Sending the same id to the same box is suppressed while there is a
+matching entry in pending, holding, done, or scheduled. `--dedupe-ttl DUR`
+overrides the root `dedupe_ttl` setting. A zero TTL (the default) suppresses
+duplicates for as long as the entry exists. A positive TTL compares against
+pending or held mtime, done receipt time (file change time), or scheduled
+storage time. Reusing an expired pending id replaces that pending body.
+
+- `ibx send BOX --lines` reads one message per nonempty stdin line and
+  assigns fresh ids unless `--id-from-body` is set. LF separates bodies.
+  `--id` is a usage error with `--lines`.
+- `ibx send --lines --tsv` routes each nonempty line as
+  `BOX<TAB>ID<TAB>BODY`, with any additional tabs kept in the body. The
+  destination may be root-relative or absolute. A malformed line reports
+  its 1-based line number and exits 2. Earlier lines stay stored. TSV
+  already supplies ids, so it cannot be combined with `--id-from-body`.
+  In both batch modes duplicates are silent. Notification failure takes
+  precedence (exit 3), followed by retry (exit 75), then success (exit 0).
+- `ibx send BOX --at TIME BODY` schedules delivery. Use RFC 3339 or a
+  relative Go duration with a leading plus, such as `+30m`. The send
+  reports storage immediately. The daemon publishes due messages on
+  startup and during its periodic wake loop, then attempts notification.
+  The scheduled filename shows the UTC due time, UTC storage time, and
+  message id. `list --scheduled` can inspect the queue before delivery.
+- `ibx send BOX --reply-to DEST BODY` records a reply destination.
+  `ibx reply ID BODY` searches the daemon root across pending, holding,
+  done, and scheduled, and sends to that destination with a fresh id.
+  Relative destinations resolve under the daemon root. An unknown id or
+  missing reply destination exits 1.
+- `ibx tee BOX --to DEST [--match REGEXP]` adds a persistent rule to the
+  root's `ibx.json`. A rule without a regex copies every arrival through
+  send, put, or scheduled delivery. A regex searches the full body as a
+  single input. The copy keeps the id, follows the destination's dedupe
+  policy, and omits the reply destination. Copies do not trigger further
+  rules. Invalid regexes and cycles exit 1. `ibx tee --list` prints
+  source, destination, and regex. `ibx tee BOX --to DEST --remove`
+  removes rules for the pair. Add `--match REGEXP` to remove only the
+  matching rule.
+
+## Periodic jobs
+
+```sh
+ibx job set watch --box alerts --every 30s -- watch-status arg
+ibx job ls --json
+ibx job rm watch
+```
+
+Set `job_path` in the root's `ibx.json` to the directories containing
+allowed executable names. The daemon runs jobs in the root directory
+with literal arguments. It passes `IBX_JOB`, `IBX_BOX`, and any variables
+listed in `job_env`. The default allowlist and environment list are empty.
+The defaults for `job_timeout`, `job_max_output`, and `job_concurrency`
+are `"30s"`, 1048576 bytes of stdout, and four concurrent runs.
+
+Jobs are due immediately after registration and then on their original
+schedule, at intervals of at least 5 seconds. An overlapping tick for the
+same job is skipped. Jobs waiting for a global slot remain due and catch
+up once when a slot opens. After downtime, a job also catches up once.
+Setting a name again replaces the job and resets its runtime state,
+including the failure count and previous stdout.
+
+By default, only changed, nonempty stdout is sent. `--tsv` routes
+`box<TAB>ID<TAB>body` lines individually. `--stdin-prev` supplies the
+previous successful stdout as input, and `--first-silent` records the
+first successful output without sending it. `--fail-after N` sends one
+notification per streak of N or more failures. A success resets the
+streak. `--once` removes the job after one completed run, and exit code
+10 removes it without sending stdout. `--ttl` expires it relative to
+registration, while `--deadline` accepts RFC 3339 or `+duration`.
+
+## Boxes and archiving
+
+`ibx boxes [--unread] [--all] [--json]` lists root-relative box paths,
+unread counts, and the oldest pending message's age in whole seconds.
+The age is empty in TSV and null in JSON for an empty box. Use
+`--unread` to list only boxes with pending messages. JSON fields are
+`box`, `unread`, and `oldest_age_seconds`.
+
+`ibx archive BOX` writes `state/archived`. Archived boxes are hidden
+from `boxes` unless `--all` is present, omitted by `status` and bulk
+owner scans, and skipped by notification. They still accept messages,
+tee copies, scheduled deliveries, and direct commands.
+`ibx unarchive BOX` removes the marker and wakes the sweep.
+
+## Notifications
+
+Configure the daemon in `<root>/ibx.json`:
+
+```json
+{
+  "notify_cmd": "printf '%s has %s pending\\n' \"$IBX_BOX\" \"$IBX_PENDING\"",
+  "retry_after": "30s",
+  "sweep_after": "5m",
+  "sweep_every": "5m",
+  "notify_timeout": "10s",
+  "boxes": {
+    "case/x/box": { "fallback": "alerts/box" }
+  }
+}
+```
+
+The daemon reads the file at each notification decision. Per-box settings
+override root settings. On `send`, `--notify-cmd` overrides
+`IBX_NOTIFY_CMD` and the file. An explicit empty `--notify-cmd` disables
+that send's hint. `--retry-after`, `--fallback`, and the existing
+`--notify-timeout SEC` also override configuration for that send.
+Fallback paths may be absolute or root-relative. Configuration durations
+use Go duration syntax, including units such as `ms`, `s`, `m`, and `h`.
+
+Send hints coalesce until `take` clears the marker or
+`--renotify-after DUR` expires (default 5m). The daemon counts pending
+messages under the box lock and only invokes a command when the count is
+positive. It runs `sh -c` in the root with its own environment plus:
+
+- `IBX_BOX` and `IBX_OWNER` contain the absolute box path and the recorded
+  owner name, which can be empty.
+- `IBX_PENDING` is the pending count at the start of the attempt.
+- `IBX_FIRST_ID` and `IBX_FIRST_LINE` describe the oldest pending message.
+  The first line is limited to 200 runes. `IBX_ID` also carries the triggering
+  message ID for compatibility with existing send hooks.
+
+Exit 0 marks the episode successful. Exit 75 requests another attempt when
+pending remains. A triggering send returns 75 in that case. Other nonzero
+statuses make a triggering send return 3 and write one failure message per
+episode to its configured fallback box. A box containing only daemon-generated
+fallback messages never forwards a failure. The daemon also sweeps boxes with
+configured commands after `sweep_after` and at intervals of `sweep_every`.
+Defaults are 30 seconds for retries, five minutes for both sweep timers, and
+10 seconds for command timeout.
+
+Each invocation appends a JSON line to `<root>/notify.log` with time, box,
+owner, pending count, exit code, and duration in milliseconds. Run
+`ibx log notify [--box DIR]` to read it even when the daemon is stopped.
 
 ## Ownership
 
@@ -79,7 +240,17 @@ resolve to exactly one winner.
   ownership under the lock, then runs the command and passes its
   exit code through; a command killed by a signal is reported as
   128 plus the signal number. The lock is not held while the command
-  runs (see limits below).
+  runs (see limits below). The wrapped command runs on the daemon side
+  as the same local user, with the client's environment and working directory.
+- `own list --as NAME [--json]` lists owned boxes under the root with their
+  unread counts. The default output is path and count separated by a tab.
+  JSON output has one object per box with `box`, `owner`, and `unread`.
+- `own pass-all --as OLD --to NEW` and `own drop-all --as NAME` operate on
+  every matching box under the root. Each result line contains the path and
+  either `ok` or an error, separated by a tab. They exit 1 if any box fails.
+
+`IBX_NAME` supplies the default for commands that accept `--as`. The daemon
+does not infer owner liveness from processes or notification results.
 
 Expiry is lazy: passing the deadline does not by itself end
 ownership. The recorded owner keeps the box until someone else
@@ -100,14 +271,23 @@ behave exactly as before, so existing scripts are unaffected.
   `done/` and prints them as usual. An id that is already held is
   skipped, never overwritten: the newer copy stays pending until the
   held one is acked (release refuses while a pending copy exists).
-- `ack ID` moves a held message from `holding/` to `done/`, replacing
-  an existing done file of the same id just like a plain take does.
-  Acking an id that is not held is an error (exit 1). Ids that start
-  with `-` need the `--` separator, as in `ack -- -dash`.
+- `ack ID [--note TEXT]` moves a held message into `done/`, records the
+  note and acknowledgment time, and clears its reported mark. The note
+  is truncated at the first LF. A new receipt replaces a done file of
+  the same id. Acking an id that is not held exits 1. Use `--` before an
+  id that starts with a dash, as in `ack -- -dash`.
+- `ibx mark ID reported` marks a done message as reported. It searches the
+  root unless a box is selected. An id without a done entry exits 1.
 - `release ID` moves a held message back to `pending/`, so a receiver
   that crashed after `take --hold` can be retried by whoever takes
   over. It fails if the id is already pending again.
-- `list --holding` lists held messages without moving them.
+- `list --holding` and `list --done` append ack note, ack time, and the
+  literal `reported` (when set) after the usual TSV columns for messages
+  with metadata. Messages without metadata keep their usual columns.
+  `list --json` works in every list mode and emits one object per message
+  with `id`, `first_line`, and any available `reply_to`, `ack_note`,
+  `ack_time`, and `reported` fields. Scheduled records include `deliver_at`.
+  Metadata is in `state/meta/<ID>.json`.
 - `ack` and `release` accept the same optional `--as` check as `take`.
 
 ```sh
@@ -134,7 +314,8 @@ replace invalid UTF-8. Put and send print plain ids; gc prints a plain count.
 Exit codes: 0 success (including duplicates); 1 I/O or runtime error;
 2 usage error; 3 send stored the message but notification failed;
 4 wait timed out; 5 the box is owned by another name; 6 an operation
-that requires an owner found none. `own run` produces 5 and 6 only
+that requires an owner found none; 75 send stored the message and scheduled
+a notification retry. `own run` produces 5 and 6 only
 before the wrapped command starts; once it starts, the exit code is
 the command's own. Callers that only need storage may ignore notification
 failure, for example `ibx --box /tmp/inbox send 'build finished' || true`.
@@ -144,12 +325,22 @@ failure, for example `ibx --box /tmp/inbox send 'build finished' || true`.
 Readers never see partial publications: write and fsync in tmp, then publish
 with a hard link. Concurrent puts of one pending id store one message.
 Only a successful rename to done outputs a message; short directory locks
-also protect overlapping id reuse. Deduplication covers pending only.
+also protect overlapping id reuse. Legacy put deduplication covers pending
+only. Send and tee deduplication also check holding, done, and scheduled.
 
-Failed or lost notifications do not lose messages: receivers can list,
-take, or wait at any time. The notified marker bounds notification floods
-by coalescing hints and allowing stale retries. Simultaneous stale retries
-may issue more than one hint; notifications are best effort.
+Pending, held, done, and scheduled messages survive a daemon crash, as do
+written metadata, owner records, archive markers, and notification state.
+Scheduled delivery atomically renames the due file into pending, so a
+restart cannot republish that scheduled entry. If another pending entry
+has the same id, the scheduled entry waits for the pending slot to clear.
+Tee copies and notify commands run separately from publication. A daemon
+crash during fan-out can leave only some destination copies. `stream` and `wait` poll
+the files on the daemon side and relay output over the socket as it
+becomes available. Notifications are best effort and can repeat during
+retries and periodic sweeps, or if the daemon dies after a hook runs but
+before it records the result. A notify command should tolerate repeated
+invocations. Receivers can list, take, or wait regardless of notification
+outcome.
 
 Delivery is at most once to the process. A receiver crash after moving a
 message but before handling it leaves it in done; recover it with
@@ -181,12 +372,12 @@ deduplication, taking everything in one call, store-then-notify with
 coalescing, and output intended for programs.
 
 Job spoolers such as filespooler run a command for each queued item in
-sequence order. ibx hands text to the reader rather than executing jobs;
-send can execute a notification command.
+sequence order. ibx jobs run on a schedule and publish changed output to
+boxes. Sending a message can trigger a notification command.
 
 Message brokers such as RabbitMQ, Redis Streams, and SQS need a server.
-ibx stays on one machine with no server; inspect it with `ls` and `cat`.
-No claims are made about other directory-queue libraries.
+ibx uses a local daemon and inspectable files. Use `ls` and `cat` to view
+its on-disk queue.
 
 ## Tests
 

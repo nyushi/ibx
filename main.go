@@ -2,7 +2,7 @@
 package main
 
 import (
-	"crypto/sha256"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,7 +10,6 @@ import (
 	"math"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -26,7 +25,36 @@ var linkFile = os.Link
 var idPattern = regexp.MustCompile(`^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$`)
 var durationPattern = regexp.MustCompile(`^(\d+(?:\.\d*)?|\.\d+)([smhd]?)$`)
 
+type invocation struct {
+	stdin          io.Reader
+	stdout, stderr io.Writer
+	env            []string
+	cwd            string
+	ctx            context.Context
+}
+
+func (c invocation) getenv(key string) string {
+	for i := len(c.env) - 1; i >= 0; i-- {
+		if k, v, ok := strings.Cut(c.env[i], "="); ok && k == key {
+			return v
+		}
+	}
+	return ""
+}
+
 type options struct {
+	job                                                           jobDefinition
+	wake                                                          chan struct{}
+	lines, tsv, idFromBody, scheduled, listJSON, headers          bool
+	unread, all, teeList, remove, hasMatch, hasKeep, hasDedupeTTL bool
+	replyTo, note, match, at                                      string
+	dedupeTTL                                                     time.Duration
+	delivery                                                      time.Time
+	invocation
+	root, fallback                                       string
+	retryAfter                                           time.Duration
+	hasRetry, hasNotify, hasNotifyTimeout, positionalBox bool
+
 	command, box, format, id, body, notify, sub, as, to, arg string
 	hasID, hasBody, done, hasSince, hasTimeout, hasTTL       bool
 	steal, hold, holding                                     bool
@@ -68,18 +96,27 @@ func seconds(s string) (float64, error) {
 	}
 	return v, nil
 }
-func parse(args []string) (o options, err error) {
-	o = options{box: os.Getenv("IBX_BOX"), format: "tsv", maxSize: 1024 * 1024, poll: 1, keep: 7 * 86400, renotify: 300, notifyTimeout: 10, notify: os.Getenv("IBX_NOTIFY_CMD")}
+func parse(args []string, call invocation) (o options, err error) {
+	o = options{invocation: call, format: "tsv", maxSize: 1024 * 1024, poll: 1, keep: 7 * 86400, renotify: 300, notifyTimeout: 10, notify: call.getenv("IBX_NOTIFY_CMD")}
+	o.hasNotify = o.notify != ""
+	var rootFlag string
 	literal := false
 	runCollect := false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
+		if o.command == "job" && (o.sub == "set" || o.sub == "rm") && o.arg == "" {
+			if !jobNamePattern.MatchString(a) {
+				return o, usageError("invalid job name: " + a)
+			}
+			o.arg = a
+			continue
+		}
 		if runCollect {
 			o.runArgs = append(o.runArgs, a)
 			continue
 		}
 		if !literal && a == "--" {
-			if o.command == "own" && o.sub == "run" {
+			if (o.command == "own" && o.sub == "run") || (o.command == "job" && o.sub == "set") {
 				runCollect = true
 			} else {
 				literal = true
@@ -91,9 +128,21 @@ func parse(args []string) (o options, err error) {
 		}
 		if !literal && strings.HasPrefix(a, "--") {
 			key, val, has := strings.Cut(a, "=")
-			common := key == "--box" || key == "--format"
+			common := key == "--box" || key == "--format" || key == "--root"
 			allowed := common
 			switch o.command {
+			case "job":
+				allowed = key == "--root" || (o.sub == "ls" && key == "--json")
+				if o.sub == "set" {
+					switch key {
+					case "--box", "--every", "--tsv", "--stdin-prev", "--first-silent", "--fail-after", "--deadline", "--ttl", "--once":
+						allowed = true
+					}
+				}
+			case "boxes":
+				allowed = allowed || key == "--unread" || key == "--all" || key == "--json"
+			case "tee":
+				allowed = allowed || key == "--to" || key == "--match" || key == "--list" || key == "--remove"
 			case "put", "send":
 				allowed = allowed || key == "--id" || key == "--max-size"
 			case "take":
@@ -101,45 +150,86 @@ func parse(args []string) (o options, err error) {
 			case "wait":
 				allowed = allowed || key == "--max" || key == "--poll" || key == "--timeout"
 			case "stream":
-				allowed = allowed || key == "--poll" || key == "--as"
+				allowed = allowed || key == "--poll" || key == "--as" || key == "--headers"
 			case "list":
-				allowed = allowed || key == "--done" || key == "--since" || key == "--holding"
+				allowed = allowed || key == "--done" || key == "--since" || key == "--holding" || key == "--scheduled" || key == "--json"
 			case "gc":
 				allowed = allowed || key == "--keep"
 			case "ack", "release":
-				allowed = allowed || key == "--as"
+				allowed = allowed || key == "--as" || (o.command == "ack" && key == "--note")
 			case "own":
 				switch o.sub {
 				case "claim":
 					allowed = allowed || key == "--as" || key == "--ttl" || key == "--steal"
-				case "pass":
+				case "pass", "pass-all":
 					allowed = allowed || key == "--as" || key == "--to"
-				case "drop":
+				case "drop", "drop-all", "list":
 					allowed = allowed || key == "--as"
 				case "run":
 					allowed = allowed || key == "--as" || key == "--ttl"
 				}
 			}
+			if o.command == "own" && o.sub == "list" && key == "--json" {
+				if has {
+					return o, usageError("--json takes no value")
+				}
+				o.format = "json"
+				continue
+			}
 			if o.command == "send" {
-				allowed = allowed || key == "--notify-cmd" || key == "--notify-timeout" || key == "--renotify-after"
+				allowed = allowed || key == "--notify-cmd" || key == "--notify-timeout" || key == "--renotify-after" || key == "--fallback" || key == "--retry-after" ||
+					key == "--lines" || key == "--tsv" || key == "--id-from-body" ||
+					key == "--dedupe-ttl" || key == "--at" || key == "--reply-to"
 			}
 			if !allowed {
 				return o, usageError("unrecognized argument: " + key)
 			}
-			if key == "--done" || key == "--hold" || key == "--holding" || key == "--steal" {
+			var flag *bool
+			switch key {
+			case "--done":
+				flag = &o.done
+			case "--hold":
+				flag = &o.hold
+			case "--holding":
+				flag = &o.holding
+			case "--steal":
+				flag = &o.steal
+			case "--lines":
+				flag = &o.lines
+			case "--tsv":
+				if o.command == "job" {
+					flag = &o.job.TSV
+				} else {
+					flag = &o.tsv
+				}
+			case "--stdin-prev":
+				flag = &o.job.StdinPrev
+			case "--first-silent":
+				flag = &o.job.FirstSilent
+			case "--once":
+				flag = &o.job.Once
+			case "--id-from-body":
+				flag = &o.idFromBody
+			case "--scheduled":
+				flag = &o.scheduled
+			case "--json":
+				flag = &o.listJSON
+			case "--headers":
+				flag = &o.headers
+			case "--unread":
+				flag = &o.unread
+			case "--all":
+				flag = &o.all
+			case "--list":
+				flag = &o.teeList
+			case "--remove":
+				flag = &o.remove
+			}
+			if flag != nil {
 				if has {
 					return o, usageError(key + " takes no value")
 				}
-				switch key {
-				case "--done":
-					o.done = true
-				case "--hold":
-					o.hold = true
-				case "--holding":
-					o.holding = true
-				case "--steal":
-					o.steal = true
-				}
+				*flag = true
 				continue
 			}
 			if !has {
@@ -149,9 +239,50 @@ func parse(args []string) (o options, err error) {
 				}
 				val = args[i]
 			}
+			if o.command == "job" {
+				if err := o.jobFlag(key, val); err != nil {
+					return o, err
+				}
+				if key != "--root" && key != "--box" {
+					continue
+				}
+			}
 			switch key {
+			case "--at":
+				if _, e := parseDelivery(val, time.Now()); e != nil {
+					return o, e
+				}
+				o.at = val
+			case "--reply-to":
+				if val == "" {
+					return o, usageError("--reply-to must not be empty")
+				}
+				o.replyTo = val
+			case "--note":
+				o.note, _, _ = strings.Cut(val, "\n")
+			case "--match":
+				o.match, o.hasMatch = val, true
+			case "--dedupe-ttl":
+				d, e := time.ParseDuration(val)
+				if e != nil || d < 0 {
+					return o, usageError("invalid --dedupe-ttl")
+				}
+				o.dedupeTTL, o.hasDedupeTTL = d, true
 			case "--box":
 				o.box = val
+			case "--root":
+				if val == "" {
+					return o, usageError("--root must not be empty")
+				}
+				rootFlag = val
+			case "--fallback":
+				o.fallback = val
+			case "--retry-after":
+				d, e := time.ParseDuration(val)
+				if e != nil || d < 0 {
+					return o, usageError("invalid --retry-after")
+				}
+				o.retryAfter, o.hasRetry = d, true
 			case "--format":
 				if val != "tsv" && val != "json" {
 					return o, usageError("invalid format")
@@ -171,7 +302,7 @@ func parse(args []string) (o options, err error) {
 				}
 				o.to = val
 			case "--notify-cmd":
-				o.notify = val
+				o.notify, o.hasNotify = val, true
 			case "--max", "--max-size":
 				v, e := strconv.Atoi(strings.TrimSpace(val))
 				if e != nil || v <= 0 {
@@ -185,7 +316,9 @@ func parse(args []string) (o options, err error) {
 			default:
 				var v float64
 				var e error
-				if key == "--keep" || key == "--since" || key == "--renotify-after" || key == "--ttl" {
+				if key == "--keep" {
+					v, e = retentionDuration(val)
+				} else if key == "--since" || key == "--renotify-after" || key == "--ttl" {
 					v, e = duration(val)
 				} else {
 					v, e = seconds(val)
@@ -195,7 +328,7 @@ func parse(args []string) (o options, err error) {
 				}
 				switch key {
 				case "--keep":
-					o.keep = v
+					o.keep, o.hasKeep = v, true
 				case "--ttl":
 					if v > maxOwnerTTL {
 						return o, usageError("ttl is too large")
@@ -213,30 +346,53 @@ func parse(args []string) (o options, err error) {
 					o.timeout = v
 					o.hasTimeout = true
 				case "--notify-timeout":
-					o.notifyTimeout = v
+					o.notifyTimeout, o.hasNotifyTimeout = v, true
 				}
 			}
 			continue
 		}
 		if o.command == "" {
 			switch a {
-			case "put", "take", "list", "wait", "stream", "send", "gc", "own", "ack", "release":
+			case "put", "take", "list", "wait", "stream", "send", "gc", "own", "ack", "release", "daemon", "status", "log", "reply", "tee", "mark", "boxes", "archive", "unarchive", "job":
 				o.command = a
 			default:
 				return o, usageError("invalid command")
 			}
+		} else if o.command == "job" {
+			switch {
+			case o.sub == "" && (a == "set" || a == "rm" || a == "ls"):
+				o.sub = a
+			default:
+				return o, usageError("invalid job name or argument: " + a)
+			}
 		} else if o.command == "own" && o.sub == "" {
 			switch a {
-			case "claim", "pass", "drop", "show", "run":
+			case "claim", "pass", "drop", "show", "run", "list", "pass-all", "drop-all":
 				o.sub = a
 			default:
 				return o, usageError("invalid own subcommand")
 			}
+		} else if o.sub == "" && ((o.command == "daemon" && (a == "stop" || a == "restart")) || (o.command == "log" && a == "notify")) {
+			o.sub = a
+		} else if (o.command == "tee" || o.command == "archive" || o.command == "unarchive") && !o.positionalBox {
+			o.box, o.positionalBox = a, true
+		} else if (o.command == "reply" || o.command == "mark") && o.arg == "" {
+			o.arg = a
+		} else if o.command == "reply" && !o.hasBody {
+			o.body, o.hasBody = a, true
+		} else if o.command == "mark" && o.sub == "" && a == "reported" {
+			o.sub = a
 		} else if (o.command == "ack" || o.command == "release") && o.arg == "" && (!strings.HasPrefix(a, "-") || literal) {
 			o.arg = a
+		} else if o.command == "send" && o.hasBody && !o.positionalBox && o.box == "" &&
+			(call.getenv("IBX_ROOT") != "" || rootFlag != "") {
+			o.box, o.body, o.positionalBox = o.body, a, true
 		} else if (o.command == "put" || o.command == "send") && !o.hasBody && (!strings.HasPrefix(a, "-") || a == "-" || literal) {
-			o.body = a
-			o.hasBody = true
+			if !o.positionalBox && o.box == "" && (call.getenv("IBX_ROOT") != "" || (o.command == "send" && rootFlag != "")) && strings.Contains(a, "/") {
+				o.box, o.positionalBox = a, true
+			} else {
+				o.body, o.hasBody = a, true
+			}
 		} else {
 			return o, usageError("unrecognized argument: " + a)
 		}
@@ -244,17 +400,61 @@ func parse(args []string) (o options, err error) {
 	if o.command == "" {
 		return o, usageError("a command is required")
 	}
-	if o.box == "" {
-		o.box = os.Getenv("IBX_BOX")
+	if o.command == "send" && o.hasBody && !o.positionalBox && o.box == "" && o.body != "-" &&
+		(o.lines || ((call.getenv("IBX_ROOT") != "" || rootFlag != "") && call.getenv("IBX_BOX") == "")) {
+		o.box, o.hasBody, o.positionalBox = o.body, false, true
 	}
-	if o.box == "" {
+	if o.lines && o.hasBody && o.body != "-" {
+		return o, usageError("--lines reads its body from stdin")
+	}
+	if o.lines && o.hasID {
+		return o, usageError("--id conflicts with --lines")
+	}
+	if o.hasID && o.idFromBody {
+		return o, usageError("--id conflicts with --id-from-body")
+	}
+	if o.tsv && (!o.lines || o.idFromBody) {
+		return o, usageError("--tsv requires --lines and explicit TSV ids")
+	}
+	if o.command == "reply" && (!idPattern.MatchString(o.arg) || !o.hasBody) {
+		return o, usageError("expected reply ID BODY")
+	}
+	if o.command == "mark" && (!idPattern.MatchString(o.arg) || o.sub != "reported") {
+		return o, usageError("expected mark ID reported")
+	}
+	if o.command == "tee" && !o.teeList && o.to == "" {
+		return o, usageError("--to is required")
+	}
+	if o.command == "job" {
+		if err := o.validateJob(); err != nil {
+			return o, err
+		}
+	}
+	if o.box == "" && o.command != "log" && o.command != "job" {
+		o.box = call.getenv("IBX_BOX")
+	}
+	if o.command == "log" && o.sub != "notify" {
+		return o, usageError("expected log notify")
+	}
+	if o.box == "" && o.command != "daemon" && o.command != "status" && o.command != "log" && !o.bulkOwner() &&
+		o.command != "reply" && o.command != "mark" && o.command != "boxes" && o.command != "job" && !o.teeList && !o.tsv {
 		return o, usageError("a box is required")
+	}
+	switch o.command {
+	case "take", "stream", "ack", "release":
+		if o.as == "" {
+			o.as = call.getenv("IBX_NAME")
+		}
+	case "own":
+		if o.as == "" && o.sub != "show" {
+			o.as = call.getenv("IBX_NAME")
+		}
 	}
 	if o.hasSince && !o.done {
 		return o, usageError("--since requires --done")
 	}
-	if o.done && o.holding {
-		return o, usageError("--done and --holding conflict")
+	if (o.done && o.holding) || (o.scheduled && (o.done || o.holding)) {
+		return o, usageError("list modes conflict")
 	}
 	if o.command == "own" {
 		if o.sub == "" {
@@ -263,7 +463,7 @@ func parse(args []string) (o options, err error) {
 		if o.sub != "show" && o.as == "" {
 			return o, usageError("--as is required")
 		}
-		if o.sub == "pass" && o.to == "" {
+		if (o.sub == "pass" || o.sub == "pass-all") && o.to == "" {
 			return o, usageError("--to is required")
 		}
 		if o.sub == "run" && len(o.runArgs) == 0 {
@@ -278,7 +478,28 @@ func parse(args []string) (o options, err error) {
 			return o, usageError("invalid id")
 		}
 	}
-	o.box, err = filepath.Abs(o.box)
+	envRoot := call.getenv("IBX_ROOT")
+	root := rootFlag
+	if root == "" {
+		root = envRoot
+	}
+	if root != "" {
+		o.root = absolute(call.cwd, root)
+	}
+	if o.box != "" {
+		base := call.cwd
+		if envRoot != "" || (rootFlag != "" && (o.command == "tee" || o.command == "archive" || o.command == "unarchive" || o.command == "job" || o.lines || (o.command == "send" && o.positionalBox))) {
+			base = o.root
+		}
+		o.box = absolute(base, o.box)
+	}
+	if o.root == "" {
+		o.root = call.cwd
+		if o.box != "" {
+			o.root = filepath.Dir(o.box)
+		}
+	}
+
 	return
 }
 func setup(box string, needHolding bool) error {
@@ -313,54 +534,31 @@ func locked(box string, fn func() error) error {
 	}
 	return fn()
 }
-func put(o options) (string, error) {
-	if o.hasID && !idPattern.MatchString(o.id) {
-		return "", usageError("invalid id")
-	}
-	var body []byte
-	var e error
+func readBody(o options) ([]byte, error) {
 	if !o.hasBody || o.body == "-" {
-		body, e = io.ReadAll(io.LimitReader(os.Stdin, int64(o.maxSize)+1))
-	} else {
-		body = []byte(o.body)
+		return io.ReadAll(io.LimitReader(o.stdin, bodyLimit(o.maxSize)))
 	}
-	if e != nil {
-		return "", e
+	return []byte(o.body), nil
+}
+
+func stageMessage(box string, body []byte) (string, error) {
+	f, err := os.CreateTemp(filepath.Join(box, "tmp"), "")
+	if err != nil {
+		return "", err
 	}
-	if len(body) == 0 || len(body) > o.maxSize {
-		return "", usageError("body is empty or exceeds maximum size")
+	_, err = f.Write(body)
+	if err == nil {
+		err = f.Sync()
 	}
-	id := o.id
-	if !o.hasID {
-		id = fmt.Sprintf("%x", sha256.Sum256(body))[:16]
+	closeErr := f.Close()
+	if err == nil {
+		err = closeErr
 	}
-	f, e := os.CreateTemp(filepath.Join(o.box, "tmp"), "")
-	if e != nil {
-		return "", e
+	if err != nil {
+		os.Remove(f.Name())
+		return "", err
 	}
-	defer os.Remove(f.Name())
-	_, e = f.Write(body)
-	if e == nil {
-		e = f.Sync()
-	}
-	ce := f.Close()
-	if e == nil {
-		e = ce
-	}
-	if e != nil {
-		return "", e
-	}
-	e = locked(o.box, func() error { return linkFile(f.Name(), filepath.Join(o.box, "pending", id+".msg")) })
-	if os.IsExist(e) {
-		fmt.Fprintln(os.Stderr, "duplicate")
-	} else if e != nil {
-		return "", e
-	}
-	if e = unlink(f.Name()); e != nil {
-		return "", e
-	}
-	_, e = fmt.Fprintln(os.Stdout, id)
-	return id, e
+	return f.Name(), nil
 }
 
 type entry struct {
@@ -404,15 +602,19 @@ func entries(dir string) ([]entry, error) {
 	})
 	return out, nil
 }
-func output(id string, body []byte, format string) error {
+func output(o options, id string, body []byte) error {
 	bodyText := sanitize(body)
+	if o.headers {
+		_, err := fmt.Fprintf(o.stdout, "%s\t%s\n", id, escapeTSV(firstLine(bodyText)))
+		return err
+	}
 	var line string
-	if format == "json" {
+	if o.format == "json" {
 		line = "{\"id\": " + jsonString(id) + ", \"body\": " + jsonString(bodyText) + "}"
 	} else {
-		line = id + "\t" + strings.NewReplacer("\\", "\\\\", "\n", "\\n", "\r", "\\r", "\t", "\\t").Replace(bodyText)
+		line = id + "\t" + escapeTSV(bodyText)
 	}
-	_, e := fmt.Fprintln(os.Stdout, line)
+	_, e := fmt.Fprintln(o.stdout, line)
 	return e
 }
 
@@ -543,7 +745,7 @@ func readLastGen(box string) (uint64, error) {
 }
 
 func writeLastGen(box string, gen uint64) error {
-	return os.WriteFile(filepath.Join(box, "state", "generation"), []byte(strconv.FormatUint(gen, 10)+"\n"), 0600)
+	return atomicWrite(filepath.Join(box, "state", "generation"), []byte(strconv.FormatUint(gen, 10)+"\n"))
 }
 
 func writeOwner(box string, rec *owner) error {
@@ -664,10 +866,10 @@ func ownClaim(o options) (int, error) {
 			}
 			nr.Gen = last + 1
 		}
-		if e := extendOwner(o.box, nr, o, now); e != nil {
+		if e := writeLastGen(o.box, nr.Gen); e != nil {
 			return e
 		}
-		if e := writeLastGen(o.box, nr.Gen); e != nil {
+		if e := extendOwner(o.box, nr, o, now); e != nil {
 			return e
 		}
 		rec = nr
@@ -676,7 +878,7 @@ func ownClaim(o options) (int, error) {
 	if e != nil {
 		return 0, e
 	}
-	_, e = fmt.Fprint(os.Stdout, ownerLine(rec, time.Now()))
+	_, e = fmt.Fprint(o.stdout, ownerLine(rec, time.Now()))
 	return 0, e
 }
 
@@ -702,10 +904,10 @@ func ownPass(o options) (int, error) {
 			return nil
 		}
 		nr := &owner{Name: o.to, Gen: cur.Gen + 1, ClaimedAt: now.UnixNano(), TTL: cur.TTL}
-		if e := extendOwner(o.box, nr, o, now); e != nil {
+		if e := writeLastGen(o.box, nr.Gen); e != nil {
 			return e
 		}
-		if e := writeLastGen(o.box, nr.Gen); e != nil {
+		if e := extendOwner(o.box, nr, o, now); e != nil {
 			return e
 		}
 		rec = nr
@@ -714,7 +916,7 @@ func ownPass(o options) (int, error) {
 	if e != nil {
 		return 0, e
 	}
-	_, e = fmt.Fprint(os.Stdout, ownerLine(rec, time.Now()))
+	_, e = fmt.Fprint(o.stdout, ownerLine(rec, time.Now()))
 	return 0, e
 }
 
@@ -751,7 +953,7 @@ func ownShow(o options) (int, error) {
 	if e != nil {
 		return 0, e
 	}
-	_, e = fmt.Fprint(os.Stdout, ownerLine(rec, time.Now()))
+	_, e = fmt.Fprint(o.stdout, ownerLine(rec, time.Now()))
 	return 0, e
 }
 
@@ -763,10 +965,16 @@ func ownRun(o options) (int, error) {
 	if e := locked(o.box, func() error { return checkOwner(o.box, o, true) }); e != nil {
 		return 0, e
 	}
-	c := exec.Command(o.runArgs[0], o.runArgs[1:]...)
-	c.Stdin = os.Stdin
-	c.Stdout = os.Stdout
-	c.Stderr = os.Stderr
+	path, e := commandPath(o, o.runArgs[0])
+	if e != nil {
+		return 0, e
+	}
+	c := exec.Command(path, o.runArgs[1:]...)
+	c.Args[0] = o.runArgs[0]
+	c.Dir, c.Env = o.cwd, o.env
+	c.Stdin = o.stdin
+	c.Stdout = o.stdout
+	c.Stderr = o.stderr
 	if e := c.Run(); e != nil {
 		var ee *exec.ExitError
 		if errors.As(e, &ee) {
@@ -837,7 +1045,8 @@ func take(o options) (int, error) {
 		if e != nil {
 			return n, e
 		}
-		if e = output(v.id, body, o.format); e != nil {
+		wakeDaemon(o)
+		if e = output(o, v.id, body); e != nil {
 			return n, e
 		}
 		n++
@@ -870,71 +1079,20 @@ func moveHeld(o options, toDone bool) (int, error) {
 				return e
 			}
 		}
-		return os.Rename(src, dst)
+		if !toDone {
+			if e := resetNotifyIfEmpty(o.box); e != nil {
+				return e
+			}
+		}
+		move := func() error { return os.Rename(src, dst) }
+		if toDone {
+			return saveReceipt(o.box, o.arg, o.note, move)
+		}
+		return move()
 	})
 	return 0, e
 }
 func nowSeconds() float64 { return float64(time.Now().UnixNano()) / 1e9 }
-func notify(o options, id string) (int, error) {
-	if o.notify == "" {
-		return 0, nil
-	}
-	marker := filepath.Join(o.box, "state/notified")
-	f, e := os.OpenFile(marker, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if os.IsExist(e) {
-		s, e := os.Stat(marker)
-		if os.IsNotExist(e) {
-			return notify(o, id)
-		}
-		if e != nil {
-			return 0, e
-		}
-		if time.Since(s.ModTime()).Seconds() < o.renotify {
-			return 0, nil
-		}
-		now := time.Now()
-		if e = os.Chtimes(marker, now, now); os.IsNotExist(e) {
-			return notify(o, id)
-		} else if e != nil {
-			return 0, e
-		}
-	} else if e != nil {
-		return 0, e
-	} else {
-		f.Close()
-	}
-	es, e := entries(filepath.Join(o.box, "pending"))
-	if e != nil {
-		return 0, e
-	}
-	c := exec.Command("sh", "-c", o.notify)
-	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	c.Env = append(os.Environ(), "IBX_BOX="+o.box, "IBX_ID="+id, "IBX_PENDING="+strconv.Itoa(len(es)))
-	c.Stdout = os.Stdout
-	c.Stderr = os.Stderr
-	e = c.Start()
-	if e == nil {
-		done := make(chan error, 1)
-		go func() { done <- c.Wait() }()
-		timer := time.NewTimer(sleepDuration(o.notifyTimeout))
-		select {
-		case e = <-done:
-			timer.Stop()
-		case <-timer.C:
-			syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
-			<-done
-			e = errors.New("notification timed out")
-		}
-	}
-	if e != nil {
-		if e = unlink(marker); e != nil {
-			return 0, e
-		}
-		fmt.Fprintln(os.Stderr, "warning: stored, notification failed")
-		return 3, nil
-	}
-	return 0, nil
-}
 func sleepDuration(s float64) time.Duration {
 	if s >= float64(math.MaxInt64)/1e9 {
 		return time.Duration(math.MaxInt64)
@@ -968,20 +1126,29 @@ func streamGuard(o options, seen *bool) error {
 }
 
 func execute(o options) (int, error) {
+	if o.bulkOwner() {
+		return bulkOwner(o)
+	}
+	switch o.command {
+	case "boxes":
+		return listBoxes(o)
+	case "tee":
+		return manageTee(o)
+	case "reply":
+		return reply(o)
+	case "mark":
+		return markReported(o)
+	case "put", "send":
+		return sendMessages(o)
+	}
 	needHolding := o.command == "ack" || o.command == "release" ||
 		(o.command == "take" && o.hold) || (o.command == "list" && o.holding)
 	if e := setup(o.box, needHolding); e != nil {
 		return 0, e
 	}
 	switch o.command {
-	case "put", "send":
-		id, e := put(o)
-		if e != nil {
-			return 0, e
-		}
-		if o.command == "send" {
-			return notify(o, id)
-		}
+	case "archive", "unarchive":
+		return 0, setArchive(o)
 	case "take":
 		_, e := take(o)
 		return 0, e
@@ -1004,37 +1171,14 @@ func execute(o options) (int, error) {
 	case "release":
 		return moveHeld(o, false)
 	case "list":
-		dir := "pending"
-		if o.done {
-			dir = "done"
-		}
-		if o.holding {
-			dir = "holding"
-		}
-		es, e := entries(filepath.Join(o.box, dir))
-		if e != nil {
-			return 0, e
-		}
-		cutoff := nowSeconds() - o.since
-		for _, v := range es {
-			if o.hasSince && v.changed < cutoff {
-				continue
-			}
-			b, e := os.ReadFile(v.path)
-			if os.IsNotExist(e) {
-				continue
-			}
-			if e != nil {
-				return 0, e
-			}
-			if e = output(v.id, b, o.format); e != nil {
-				return 0, e
-			}
-		}
+		return 0, listMessages(o)
 	case "wait", "stream":
 		start := time.Now()
 		seenOwner := false
 		for {
+			if o.ctx.Err() != nil {
+				return 0, nil
+			}
 			if o.command == "stream" {
 				if o.as != "" {
 					if e := streamGuard(o, &seenOwner); e != nil {
@@ -1067,76 +1211,56 @@ func execute(o options) (int, error) {
 				}
 				delay = math.Min(delay, remaining)
 			}
-			time.Sleep(sleepDuration(delay))
+			timer := time.NewTimer(sleepDuration(delay))
+			select {
+			case <-timer.C:
+			case <-o.ctx.Done():
+				timer.Stop()
+				return 0, nil
+			}
 		}
 	case "gc":
-		now := nowSeconds()
-		n := 0
-		for _, dir := range []string{"done", "tmp"} {
-			ds, e := os.ReadDir(filepath.Join(o.box, dir))
-			if e != nil {
-				return 0, e
-			}
-			for _, d := range ds {
-				p := filepath.Join(o.box, dir, d.Name())
-				s, e := os.Stat(p)
-				if os.IsNotExist(e) {
-					continue
-				}
-				if e != nil {
-					return 0, e
-				}
-				age := 3600.0
-				stamp := float64(s.ModTime().UnixNano()) / 1e9
-				if dir == "done" {
-					age = o.keep
-					stamp = changed(s)
-				}
-				if s.Mode().IsRegular() && (dir == "tmp" || strings.HasSuffix(d.Name(), ".msg")) && now-stamp > age {
-					e = os.Remove(p)
-					if os.IsNotExist(e) {
-						continue
-					}
-					if e != nil {
-						return 0, e
-					}
-					n++
-				}
-			}
-		}
-		_, e := fmt.Fprintln(os.Stdout, n)
-		return 0, e
+		return 0, collect(o)
+
 	}
 	return 0, nil
 }
 func runCLI(args []string) int {
-	o, e := parse(args)
+	call := localInvocation()
+	o, e := parse(args, call)
 	if e != nil {
-		if e.Error() == "help" {
-			fmt.Fprintln(os.Stdout, "usage: ibx [--box DIR] [--format tsv|json] {put,take,list,wait,stream,send,gc,own,ack,release}")
-			return 0
-		}
-		fmt.Fprintln(os.Stderr, "error:", e)
-		return 2
+		return parseResult(call, e)
 	}
+	return commandResult(o)
+}
+
+func parseResult(call invocation, e error) int {
+	if e.Error() == "help" {
+		fmt.Fprintln(call.stdout, "usage: ibx [--root DIR] [--box DIR] [--format tsv|json] {put,take,list,wait,stream,send,gc,own,ack,release,daemon,status,log,reply,tee,mark,boxes,archive,unarchive,job}")
+		return 0
+	}
+	fmt.Fprintln(call.stderr, "error:", e)
+	return 2
+}
+
+func commandResult(o options) int {
 	code, e := execute(o)
 	if e != nil {
 		var xe *exitError
 		if errors.As(e, &xe) {
-			fmt.Fprintln(os.Stderr, "error:", e)
+			fmt.Fprintln(o.stderr, "error:", e)
 			return xe.code
 		}
 		var usage usageError
 		if errors.As(e, &usage) {
-			fmt.Fprintln(os.Stderr, "error:", e)
+			fmt.Fprintln(o.stderr, "error:", e)
 			return 2
 		}
 		if errors.Is(e, syscall.EPIPE) && o.command == "stream" {
 			return 0
 		}
-		fmt.Fprintln(os.Stderr, "error:", e)
+		fmt.Fprintln(o.stderr, "error:", e)
 		return 1
 	}
 	return code
 }
-func main() { signal.Ignore(syscall.SIGPIPE); os.Exit(runCLI(os.Args[1:])) }

@@ -18,6 +18,12 @@ import (
 var binary string
 
 func TestMain(m *testing.M) {
+	if os.Getenv("IBX_UID_PROBE") == "1" || os.Getenv("IBX_TEST_SCHEDULER_ROOT") != "" {
+		os.Exit(m.Run())
+	}
+	for _, key := range []string{"IBX_ROOT", "IBX_SOCKET", "IBX_BOX", "IBX_NAME", "IBX_AUTOSTART", "IBX_NOTIFY_CMD"} {
+		os.Unsetenv(key)
+	}
 	area, err := os.MkdirTemp("", "ibx-tests-")
 	if err != nil {
 		panic(err)
@@ -33,7 +39,18 @@ func TestMain(m *testing.M) {
 	os.RemoveAll(area)
 	os.Exit(code)
 }
-func box(t *testing.T) string { t.Helper(); return filepath.Join(t.TempDir(), "box") }
+func box(t *testing.T) string {
+	t.Helper()
+	root, err := os.MkdirTemp(filepath.Dir(binary), "b-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		exec.Command(binary, "--root", root, "daemon", "stop").Run()
+		os.RemoveAll(root)
+	})
+	return filepath.Join(root, "box")
+}
 func command(b string, args ...string) *exec.Cmd {
 	return exec.Command(binary, append([]string{"--box", b}, args...)...)
 }
@@ -343,8 +360,13 @@ func TestSendEnvironment(t *testing.T) {
 	secret := "private body text"
 	run(t, b, 0, nil, "send", "--id", "item", "--notify-cmd", `env > "$IBX_BOX/environment"`, secret)
 	env := read(t, filepath.Join(b, "environment"))
-	if strings.Contains(env, secret) {
-		t.Fatal("body leaked")
+	if !strings.Contains(env, "IBX_FIRST_LINE="+secret+"\n") {
+		t.Fatal("missing first-line metadata")
+	}
+	for _, line := range strings.Split(env, "\n") {
+		if !strings.HasPrefix(line, "IBX_FIRST_LINE=") && strings.Contains(line, secret) {
+			t.Fatal("body leaked outside IBX_FIRST_LINE")
+		}
 	}
 	for _, v := range []string{"IBX_ID=item\n", "IBX_PENDING=1\n", "IBX_BOX=" + b + "\n"} {
 		if !strings.Contains(env, v) {
