@@ -21,7 +21,7 @@ func TestMain(m *testing.M) {
 	if os.Getenv("IBX_UID_PROBE") == "1" || os.Getenv("IBX_TEST_SCHEDULER_ROOT") != "" {
 		os.Exit(m.Run())
 	}
-	for _, key := range []string{"IBX_ROOT", "IBX_SOCKET", "IBX_BOX", "IBX_NAME", "IBX_AUTOSTART", "IBX_NOTIFY_CMD"} {
+	for _, key := range []string{"IBX_ROOT", "IBX_SOCKET", "IBX_BOX", "IBX_NAME", "IBX_AUTOSTART", "IBX_AUTORESTART", "IBX_NOTIFY_CMD"} {
 		os.Unsetenv(key)
 	}
 	area, err := os.MkdirTemp("", "ibx-tests-")

@@ -51,7 +51,7 @@ type options struct {
 	dedupeTTL                                                     time.Duration
 	delivery                                                      time.Time
 	invocation
-	root, fallback                                       string
+	root, rootSource, fallback                           string
 	retryAfter                                           time.Duration
 	hasRetry, hasNotify, hasNotifyTimeout, positionalBox bool
 
@@ -100,6 +100,10 @@ func parse(args []string, call invocation) (o options, err error) {
 	o = options{invocation: call, format: "tsv", maxSize: 1024 * 1024, poll: 1, keep: 7 * 86400, renotify: 300, notifyTimeout: 10, notify: call.getenv("IBX_NOTIFY_CMD")}
 	o.hasNotify = o.notify != ""
 	var rootFlag string
+	if len(args) == 1 && (args[0] == "--version" || args[0] == "version") {
+		o.command = "version"
+		return
+	}
 	literal := false
 	runCollect := false
 	for i := 0; i < len(args); i++ {
@@ -388,7 +392,7 @@ func parse(args []string, call invocation) (o options, err error) {
 			(call.getenv("IBX_ROOT") != "" || rootFlag != "") {
 			o.box, o.body, o.positionalBox = o.body, a, true
 		} else if (o.command == "put" || o.command == "send") && !o.hasBody && (!strings.HasPrefix(a, "-") || a == "-" || literal) {
-			if !o.positionalBox && o.box == "" && (call.getenv("IBX_ROOT") != "" || (o.command == "send" && rootFlag != "")) && strings.Contains(a, "/") {
+			if !o.positionalBox && o.box == "" && (call.getenv("IBX_ROOT") != "" || (rootFlag != "" && (o.command == "send" || filepath.IsAbs(a)))) && strings.Contains(a, "/") {
 				o.box, o.positionalBox = a, true
 			} else {
 				o.body, o.hasBody = a, true
@@ -480,8 +484,11 @@ func parse(args []string, call invocation) (o options, err error) {
 	}
 	envRoot := call.getenv("IBX_ROOT")
 	root := rootFlag
-	if root == "" {
-		root = envRoot
+	switch {
+	case rootFlag != "":
+		o.rootSource = "--root"
+	case envRoot != "":
+		root, o.rootSource = envRoot, "IBX_ROOT"
 	}
 	if root != "" {
 		o.root = absolute(call.cwd, root)
@@ -494,9 +501,13 @@ func parse(args []string, call invocation) (o options, err error) {
 		o.box = absolute(base, o.box)
 	}
 	if o.root == "" {
-		o.root = call.cwd
+		o.root, o.rootSource = call.cwd, "inferred from the working directory"
 		if o.box != "" {
-			o.root = filepath.Dir(o.box)
+			o.root, o.rootSource = filepath.Dir(o.box), "inferred from --box"
+		}
+	} else if o.box != "" {
+		if err := checkBoxRoot(o.root, o.box); err != nil {
+			return o, err
 		}
 	}
 
@@ -1130,6 +1141,9 @@ func execute(o options) (int, error) {
 		return bulkOwner(o)
 	}
 	switch o.command {
+	case "version":
+		_, err := fmt.Fprintln(o.stdout, "ibx", ibxVersion)
+		return 0, err
 	case "boxes":
 		return listBoxes(o)
 	case "tee":
@@ -1236,7 +1250,7 @@ func runCLI(args []string) int {
 
 func parseResult(call invocation, e error) int {
 	if e.Error() == "help" {
-		fmt.Fprintln(call.stdout, "usage: ibx [--root DIR] [--box DIR] [--format tsv|json] {put,take,list,wait,stream,send,gc,own,ack,release,daemon,status,log,reply,tee,mark,boxes,archive,unarchive,job}")
+		fmt.Fprintln(call.stdout, "usage: ibx [--root DIR] [--box DIR] [--format tsv|json] {put,take,list,wait,stream,send,gc,own,ack,release,daemon,status,log,reply,tee,mark,boxes,archive,unarchive,job,version}")
 		return 0
 	}
 	fmt.Fprintln(call.stderr, "error:", e)

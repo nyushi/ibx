@@ -114,3 +114,36 @@ func bulkOwner(o options) (int, error) {
 	}
 	return code, err
 }
+
+// Resolve existing symlinks even when the box itself has yet to be created.
+func resolveBoxPath(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err == nil || !os.IsNotExist(err) {
+		return resolved, err
+	}
+	if _, statErr := os.Lstat(path); !os.IsNotExist(statErr) {
+		return "", err
+	}
+	parent := filepath.Dir(path)
+	if parent == path {
+		return "", err
+	}
+	resolved, err = resolveBoxPath(parent)
+	return filepath.Join(resolved, filepath.Base(path)), err
+}
+
+func checkBoxRoot(root, box string) error {
+	resolvedRoot, err := resolveBoxPath(root)
+	if err != nil {
+		return usageError(fmt.Sprintf("cannot resolve box %q within root %q: %v", box, root, err))
+	}
+	resolvedBox, err := resolveBoxPath(box)
+	if err != nil {
+		return usageError(fmt.Sprintf("cannot resolve box %q within root %q: %v", box, root, err))
+	}
+	rel, err := filepath.Rel(resolvedRoot, resolvedBox)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return usageError(fmt.Sprintf("box %q is outside root %q", box, root))
+	}
+	return nil
+}

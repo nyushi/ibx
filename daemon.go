@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,22 +22,26 @@ import (
 	"time"
 )
 
-var ibxVersion = "2.0.0"
+var ibxVersion = "2.0.1"
 
 const protocolVersion = 1
 const startupTimeout = 5 * time.Second
 const restartLockEnv = "_IBX_RESTART_LOCK_FD"
+const daemonRootSourceEnv = "_IBX_DAEMON_ROOT_SOURCE"
+const daemonFallbackEnv = "_IBX_DAEMON_FALLBACK"
+const maxSocketPath = 107
 
 type packet struct {
-	Version  string   `json:"version,omitempty"`
-	Protocol int      `json:"protocol,omitempty"`
-	Args     []string `json:"args,omitempty"`
-	Env      []string `json:"env,omitempty"`
-	Cwd      string   `json:"cwd,omitempty"`
-	Data     []byte   `json:"data,omitempty"`
-	Kind     string   `json:"kind,omitempty"`
-	Error    string   `json:"error,omitempty"`
-	Code     int      `json:"code,omitempty"`
+	Executable string   `json:"executable,omitempty"`
+	Version    string   `json:"version,omitempty"`
+	Protocol   int      `json:"protocol,omitempty"`
+	Args       []string `json:"args,omitempty"`
+	Env        []string `json:"env,omitempty"`
+	Cwd        string   `json:"cwd,omitempty"`
+	Data       []byte   `json:"data,omitempty"`
+	Kind       string   `json:"kind,omitempty"`
+	Error      string   `json:"error,omitempty"`
+	Code       int      `json:"code,omitempty"`
 }
 
 func localInvocation() invocation {
@@ -68,11 +73,34 @@ func commandPath(o options, name string) (string, error) {
 	return "", fmt.Errorf("%s: %w", name, exec.ErrNotFound)
 }
 
-func socketPath(o options) string {
+func socketPath(o options) (path string, fallback bool) {
 	if path := o.getenv("IBX_SOCKET"); path != "" {
-		return absolute(o.cwd, path)
+		return absolute(o.cwd, path), false
 	}
-	return filepath.Join(o.root, "ibx.sock")
+	path = filepath.Join(o.root, "ibx.sock")
+	if len(path) <= maxSocketPath {
+		return path, false
+	}
+	dir := absolute(o.cwd, os.TempDir())
+	if runtime := o.getenv("XDG_RUNTIME_DIR"); runtime != "" {
+		runtime = absolute(o.cwd, runtime)
+		if st, err := os.Stat(runtime); err == nil && st.IsDir() {
+			dir = runtime
+		}
+	}
+	hash := sha256.Sum256([]byte(o.root))
+	return filepath.Join(dir, fmt.Sprintf("ibx-%x.sock", hash[:8])), true
+}
+
+func checkSocketPath(path string) error {
+	if len(path) > maxSocketPath {
+		return fmt.Errorf("socket path %q is %d bytes and exceeds the ~108-byte sun_path limit; set IBX_SOCKET to a shorter location", path, len(path))
+	}
+	return nil
+}
+
+func daemonError(o options, path string, err error) error {
+	return fmt.Errorf("root %q (%s), socket %q: %w", o.root, o.rootSource, path, err)
 }
 
 func peerUID(c *net.UnixConn) (uint32, error) {
@@ -94,6 +122,9 @@ func peerUID(c *net.UnixConn) (uint32, error) {
 }
 
 func connect(path string) (*net.UnixConn, error) {
+	if err := checkSocketPath(path); err != nil {
+		return nil, err
+	}
 	c, err := net.DialTimeout("unix", path, 500*time.Millisecond)
 	if err != nil {
 		return nil, err
@@ -102,12 +133,12 @@ func connect(path string) (*net.UnixConn, error) {
 	uid, err := peerUID(conn)
 	if err != nil || uid != uint32(os.Geteuid()) {
 		conn.Close()
-		return nil, fmt.Errorf("refusing daemon peer UID %d (expected %d): %v", uid, os.Geteuid(), err)
+		return nil, fmt.Errorf("socket %q: refusing daemon peer UID %d (expected %d): %v", path, uid, os.Geteuid(), err)
 	}
 	return conn, nil
 }
 
-func launchDaemon(o options, path string) (<-chan error, error) {
+func launchDaemon(o options, path string, fallback bool) (<-chan error, error) {
 	if err := os.MkdirAll(o.root, 0700); err != nil {
 		return nil, err
 	}
@@ -121,7 +152,7 @@ func launchDaemon(o options, path string) (<-chan error, error) {
 		return nil, err
 	}
 	cmd := exec.Command(binary, "daemon")
-	cmd.Env = daemonEnv(o, path)
+	cmd.Env = daemonEnv(o, path, fallback)
 	cmd.Stdout, cmd.Stderr = log, log
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
@@ -132,14 +163,18 @@ func launchDaemon(o options, path string) (<-chan error, error) {
 	return exited, nil
 }
 
-func daemonEnv(o options, path string) []string {
-	env := make([]string, 0, len(o.env)+2)
+func daemonEnv(o options, path string, fallback bool) []string {
+	env := make([]string, 0, len(o.env)+4)
 	for _, value := range o.env {
-		if !strings.HasPrefix(value, "IBX_ROOT=") && !strings.HasPrefix(value, "IBX_SOCKET=") && !strings.HasPrefix(value, restartLockEnv+"=") {
+		key, _, _ := strings.Cut(value, "=")
+		switch key {
+		case "IBX_ROOT", "IBX_SOCKET", restartLockEnv, daemonRootSourceEnv, daemonFallbackEnv:
+		default:
 			env = append(env, value)
 		}
 	}
-	return append(env, "IBX_ROOT="+o.root, "IBX_SOCKET="+path)
+	return append(env, "IBX_ROOT="+o.root, "IBX_SOCKET="+path,
+		daemonRootSourceEnv+"="+o.rootSource, daemonFallbackEnv+"="+strconv.FormatBool(fallback))
 }
 
 func waitForSocket(path string, exited <-chan error, logPath string) (*net.UnixConn, error) {
@@ -179,8 +214,16 @@ func waitForSocket(path string, exited <-chan error, logPath string) (*net.UnixC
 	}
 }
 
-func client(o options, args []string) (int, error) {
-	path := socketPath(o)
+func client(o options, args []string) (code int, err error) {
+	path, fallback := socketPath(o)
+	defer func() {
+		if err != nil {
+			err = daemonError(o, path, err)
+		}
+	}()
+	if err := checkSocketPath(path); err != nil {
+		return 1, err
+	}
 	conn, err := connect(path)
 	if err != nil {
 		if o.command == "status" || o.command == "daemon" {
@@ -189,45 +232,138 @@ func client(o options, args []string) (int, error) {
 		if o.getenv("IBX_AUTOSTART") == "0" {
 			return 1, fmt.Errorf("cannot connect to daemon (IBX_AUTOSTART=0): %w", err)
 		}
-		exited, startErr := launchDaemon(o, path)
+		if strings.HasPrefix(o.rootSource, "inferred ") {
+			fmt.Fprintf(o.stderr, "ibx: autostart for root %q (%s), socket %q\n", o.root, o.rootSource, path)
+		}
+		exited, startErr := launchDaemon(o, path, fallback)
 		if startErr != nil {
 			return 1, fmt.Errorf("start daemon: %w", startErr)
 		}
-		if conn, err = waitForSocket(path, exited, filepath.Join(o.root, "daemon.log")); err != nil {
-			return 1, fmt.Errorf("daemon did not become ready (see %s): %w", filepath.Join(o.root, "daemon.log"), err)
+		logPath := filepath.Join(o.root, "daemon.log")
+		if conn, err = waitForSocket(path, exited, logPath); err != nil {
+			return 1, fmt.Errorf("daemon did not become ready (see %s): %w", logPath, err)
 		}
 	}
-	defer conn.Close()
-	code, err := exchange(conn, conn.CloseWrite, o, args)
+	code, err = exchange(conn, conn.CloseWrite, o, args)
+	conn.Close()
 	if err == nil && code == 0 && o.command == "daemon" && o.sub == "restart" {
-		ready, e := waitForSocket(path, nil, "")
-		if e != nil {
-			return 1, fmt.Errorf("daemon restart: %w", e)
+		ready, err := waitForSocket(path, nil, "")
+		if err != nil {
+			return 1, fmt.Errorf("daemon restart: %w", err)
 		}
+		mismatch, err := daemonHello(ready, json.NewEncoder(ready), json.NewDecoder(ready))
 		ready.Close()
+		if err != nil {
+			return 1, fmt.Errorf("daemon restart: %w", err)
+		}
+		if mismatch != nil {
+			return 1, fmt.Errorf("daemon restart: %w", mismatch)
+		}
+	}
+	var mismatch *versionMismatch
+	if !o.daemonControl() && o.getenv("IBX_AUTORESTART") == "1" && errors.As(err, &mismatch) {
+		code, recoveryErr := recoverVersion(o, path, args)
+		if recoveryErr != nil {
+			return 1, fmt.Errorf("%w; IBX_AUTORESTART=1 attempted ibx daemon restart and command retry: %v", mismatch, recoveryErr)
+		}
+		return code, nil
 	}
 	return code, err
 }
 
-func exchange(conn net.Conn, closeInput func() error, o options, args []string) (int, error) {
-	var err error
-	enc, dec := json.NewEncoder(conn), json.NewDecoder(conn)
+type versionMismatch struct{ detail string }
+
+func (e *versionMismatch) Error() string {
+	return e.detail + "; run: ibx daemon restart (works across versions that support restart control), or set IBX_AUTORESTART=1"
+}
+
+func (e *versionMismatch) controlError(err error) error {
+	if e != nil && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET)) {
+		return errors.New(e.detail + "; the running daemon is too old to accept restart control. " +
+			"Stop it with its matching client (run ibx daemon stop using the daemon's version) or terminate the daemon process, " +
+			"then retry your original command. The new client will autostart a daemon of its own version.")
+	}
+	return err
+}
+
+func versionMismatchText(client, daemon packet) string {
+	return fmt.Sprintf("daemon version mismatch: client %s/%d, daemon %s/%d", client.Version, client.Protocol, daemon.Version, daemon.Protocol)
+}
+
+func (o options) daemonControl() bool {
+	return o.command == "daemon" && (o.sub == "restart" || o.sub == "stop")
+}
+
+func recoverVersion(o options, path string, args []string) (int, error) {
+	control := o
+	control.command, control.sub = "daemon", "restart"
+	conn, err := connect(path)
+	if err != nil {
+		return 1, fmt.Errorf("connect for restart: %w", err)
+	}
+	code, err := exchange(conn, conn.CloseWrite, control, []string{"daemon", "restart"})
+	conn.Close()
+	if err != nil {
+		return 1, fmt.Errorf("restart request: %w", err)
+	}
+	if code != 0 {
+		return 1, fmt.Errorf("restart exited with code %d", code)
+	}
+	conn, err = waitForSocket(path, nil, "")
+	if err != nil {
+		return 1, fmt.Errorf("wait for replacement daemon: %w", err)
+	}
+	defer conn.Close()
+	// exchange verifies the replacement hello before it sends the original
+	// request or reads its stdin.
+	return exchange(conn, conn.CloseWrite, o, args)
+}
+
+func daemonHello(conn net.Conn, enc *json.Encoder, dec *json.Decoder) (*versionMismatch, error) {
 	conn.SetDeadline(time.Now().Add(startupTimeout))
-	if err = enc.Encode(packet{Version: ibxVersion, Protocol: protocolVersion}); err != nil {
-		return 1, err
+	local := packet{Version: ibxVersion, Protocol: protocolVersion}
+	if err := enc.Encode(local); err != nil {
+		return nil, fmt.Errorf("send daemon hello: %w", err)
 	}
 	var hello packet
-	if err = dec.Decode(&hello); err != nil {
-		return 1, fmt.Errorf("daemon handshake: %w", err)
+	if err := dec.Decode(&hello); err != nil {
+		return nil, fmt.Errorf("daemon handshake: %w", err)
 	}
-	if hello.Error != "" {
-		return 1, errors.New(hello.Error)
+	switch {
+	case hello.Error != "" && strings.Contains(hello.Error, "version mismatch"):
+		return &versionMismatch{hello.Error}, nil
+	case hello.Error != "":
+		return nil, errors.New(hello.Error)
+	case hello.Version != local.Version || hello.Protocol != local.Protocol:
+		return &versionMismatch{versionMismatchText(local, hello)}, nil
+	default:
+		return nil, nil
 	}
-	if hello.Version != ibxVersion || hello.Protocol != protocolVersion {
-		return 1, fmt.Errorf("daemon version mismatch: client %s/%d, daemon %s/%d", ibxVersion, protocolVersion, hello.Version, hello.Protocol)
+}
+
+func exchange(conn net.Conn, closeInput func() error, o options, args []string) (int, error) {
+	enc, dec := json.NewEncoder(conn), json.NewDecoder(conn)
+	mismatch, err := daemonHello(conn, enc, dec)
+	if err != nil {
+		return 1, err
 	}
-	conn.SetDeadline(time.Time{})
 	request := packet{Args: args, Env: o.env, Cwd: o.cwd}
+	if mismatch != nil {
+		if !o.daemonControl() {
+			return 1, mismatch
+		}
+		if o.sub == "restart" {
+			request.Executable, err = os.Executable()
+			if err != nil {
+				return 1, err
+			}
+		}
+		// A cross-version peer only needs the control command and executable.
+		request.Args = []string{"daemon", o.sub}
+	} else {
+		conn.SetDeadline(time.Time{})
+	}
 	if !o.lines && (o.command == "put" || o.command == "send") && (!o.hasBody || o.body == "-") {
 		request.Data, err = io.ReadAll(io.LimitReader(o.stdin, bodyLimit(o.maxSize)))
 		if err != nil {
@@ -235,7 +371,10 @@ func exchange(conn net.Conn, closeInput func() error, o options, args []string) 
 		}
 	}
 	if err = enc.Encode(request); err != nil {
-		return 1, err
+		return 1, mismatch.controlError(err)
+	}
+	if mismatch != nil {
+		conn.SetDeadline(time.Time{})
 	}
 	rawInput := o.lines || (o.command == "own" && o.sub == "run")
 	if rawInput {
@@ -244,7 +383,10 @@ func exchange(conn net.Conn, closeInput func() error, o options, args []string) 
 	for {
 		var reply packet
 		if err = dec.Decode(&reply); err != nil {
-			return 1, fmt.Errorf("daemon disconnected: %w", err)
+			return 1, mismatch.controlError(fmt.Errorf("daemon disconnected: %w", err))
+		}
+		if reply.Error != "" {
+			return 1, errors.New(reply.Error)
 		}
 		switch reply.Kind {
 		case "exit":
@@ -306,6 +448,7 @@ func (w responseWriter) Write(data []byte) (int, error) {
 
 type shutdownRequest struct {
 	restart       bool
+	executable    string
 	done, replied chan struct{}
 }
 
@@ -344,15 +487,18 @@ func (d daemonServer) serveVerified(conn net.Conn, finishControl func()) {
 	if err := decodeLine(input, &hello); err != nil {
 		return
 	}
-	if hello.Version != ibxVersion || hello.Protocol != protocolVersion {
-		enc.Encode(packet{Error: fmt.Sprintf("version mismatch: client %s/%d, daemon %s/%d", hello.Version, hello.Protocol, ibxVersion, protocolVersion)})
+	local := packet{Version: ibxVersion, Protocol: protocolVersion}
+	mismatch := hello.Version != local.Version || hello.Protocol != local.Protocol
+	if mismatch {
+		local.Error = versionMismatchText(hello, local)
+	}
+	if err := enc.Encode(local); err != nil {
 		return
 	}
-	if err := enc.Encode(packet{Version: ibxVersion, Protocol: protocolVersion}); err != nil {
-		return
+	if !mismatch {
+		// The client may be reading stdin before it sends the request.
+		conn.SetReadDeadline(time.Time{})
 	}
-	// The client may be reading stdin before it sends the request.
-	conn.SetReadDeadline(time.Time{})
 	var request packet
 	requestReady := make(chan struct{})
 	watchDone := make(chan struct{})
@@ -381,12 +527,23 @@ func (d daemonServer) serveVerified(conn net.Conn, finishControl func()) {
 	res := &response{enc: enc, ctx: ctx}
 	call := invocation{bytes.NewReader(request.Data), responseWriter{res, "stdout"}, responseWriter{res, "stderr"}, request.Env, request.Cwd, ctx}
 	o, err := parse(request.Args, call)
+	if mismatch && (err != nil || !o.daemonControl()) {
+		enc.Encode(packet{Error: local.Error})
+		return
+	}
 	if err == nil && o.command == "daemon" {
 		if o.sub == "" {
 			enc.Encode(packet{Kind: "exit", Code: 2})
 			return
 		}
 		req := shutdownRequest{restart: o.sub == "restart", done: make(chan struct{}), replied: make(chan struct{})}
+		if mismatch && req.restart {
+			if request.Executable != "" && !filepath.IsAbs(request.Executable) {
+				enc.Encode(packet{Error: "restart executable must be an absolute path"})
+				return
+			}
+			req.executable = request.Executable
+		}
 		select {
 		case d.shutdown <- req:
 			finishControl()
@@ -488,7 +645,10 @@ func (d daemonServer) status(out io.Writer) error {
 	return err
 }
 
-func listen(o options, path string) (*net.UnixListener, *os.File, error) {
+func listen(o options, path string, fallback bool) (*net.UnixListener, *os.File, error) {
+	if err := checkSocketPath(path); err != nil {
+		return nil, nil, err
+	}
 	if err := os.MkdirAll(o.root, 0700); err != nil {
 		return nil, nil, err
 	}
@@ -496,18 +656,32 @@ func listen(o options, path string) (*net.UnixListener, *os.File, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if !parent.IsDir() || parent.Sys().(*syscall.Stat_t).Uid != uint32(os.Geteuid()) {
-		return nil, nil, fmt.Errorf("socket directory must be owned by UID %s", strconv.Itoa(os.Geteuid()))
+	// Automatic fallback can use a shared sticky directory such as /tmp.
+	if !parent.IsDir() || (parent.Sys().(*syscall.Stat_t).Uid != uint32(os.Geteuid()) &&
+		!(fallback && parent.Mode()&os.ModeSticky != 0)) {
+		return nil, nil, fmt.Errorf("socket directory must be owned by UID %d; set IBX_ROOT or --root to a directory owned by the user", os.Geteuid())
 	}
 	lock, err := socketLock(o, path+".lock")
 	if err != nil {
 		return nil, nil, err
 	}
 	listener, err := func() (*net.UnixListener, error) {
+		if fallback {
+			st, err := lock.Stat()
+			if err != nil {
+				return nil, err
+			}
+			if !st.Mode().IsRegular() || st.Sys().(*syscall.Stat_t).Uid != uint32(os.Geteuid()) {
+				return nil, fmt.Errorf("socket lock %q must be a regular file owned by the daemon user", lock.Name())
+			}
+		}
 		if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 			return nil, fmt.Errorf("daemon already running or starting at %s: %w", path, err)
 		}
 		if st, err := os.Lstat(path); err == nil {
+			if fallback && st.Sys().(*syscall.Stat_t).Uid != uint32(os.Geteuid()) {
+				return nil, fmt.Errorf("socket path %q is owned by a different user", path)
+			}
 			if st.Mode()&os.ModeSocket == 0 {
 				return nil, fmt.Errorf("socket path %s is not a socket", path)
 			}
@@ -567,9 +741,18 @@ func socketLock(o options, path string) (*os.File, error) {
 	return file, nil
 }
 
-func runDaemon(o options) error {
-	path := socketPath(o)
-	ln, lock, err := listen(o, path)
+func runDaemon(o options) (err error) {
+	path, fallback := socketPath(o)
+	if source := o.getenv(daemonRootSourceEnv); source != "" {
+		o.rootSource = source
+		fallback = o.getenv(daemonFallbackEnv) == "true"
+	}
+	defer func() {
+		if err != nil {
+			err = daemonError(o, path, err)
+		}
+	}()
+	ln, lock, err := listen(o, path, fallback)
 	if err != nil {
 		return err
 	}
@@ -588,12 +771,13 @@ func runDaemon(o options) error {
 	signalCtx, stopSignals := signal.NotifyContext(ctx, syscall.SIGTERM, syscall.SIGINT)
 	defer stopSignals()
 	var requests sync.WaitGroup
-	accepted := make(chan struct{})
+	accepted := make(chan error, 1)
 	go func() {
-		defer close(accepted)
 		for {
 			conn, err := ln.AcceptUnix()
 			if err != nil {
+				accepted <- err
+				close(accepted)
 				return
 			}
 			requests.Add(1)
@@ -606,7 +790,7 @@ func runDaemon(o options) error {
 	select {
 	case shutdown = <-d.shutdown:
 	case <-signalCtx.Done():
-	case <-accepted:
+	case err = <-accepted:
 	}
 	ln.Close()
 	cancel()
@@ -619,17 +803,20 @@ func runDaemon(o options) error {
 		<-shutdown.replied
 	}
 	if shutdown.restart {
-		binary, err := os.Executable()
-		if err != nil {
-			return err
+		binary := shutdown.executable
+		if binary == "" {
+			binary, err = os.Executable()
+			if err != nil {
+				return err
+			}
 		}
 		if _, _, errno := syscall.Syscall(syscall.SYS_FCNTL, lock.Fd(), syscall.F_SETFD, 0); errno != 0 {
 			return errno
 		}
-		env := append(daemonEnv(o, path), restartLockEnv+"="+strconv.FormatUint(uint64(lock.Fd()), 10))
+		env := append(daemonEnv(o, path, fallback), restartLockEnv+"="+strconv.FormatUint(uint64(lock.Fd()), 10))
 		return syscall.Exec(binary, []string{binary, "daemon"}, env)
 	}
-	return nil
+	return err
 }
 
 func decodeLine(reader *bufio.Reader, p *packet) error {
@@ -685,6 +872,8 @@ func main() {
 		err = runDaemon(o)
 	case o.command == "log":
 		err = readNotifyLog(o)
+	case o.command == "version":
+		code = commandResult(o)
 	default:
 		code, err = client(o, args)
 	}

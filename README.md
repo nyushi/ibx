@@ -17,12 +17,21 @@ resulting binary to a directory on your command search path.
 
 ## Daemon
 
-A daemon serves one root. Use `--root DIR` or set `IBX_ROOT` to select it.
-With neither, the root is the directory containing the resolved box, or the
-working directory for root-wide commands without a box. The default socket is
-`<root>/ibx.sock`. Set `IBX_SOCKET` to override it. Its directory must be
-owned by the daemon user, its mode is 0600, and the daemon checks the peer's
-UID. Clients and daemons must have matching binary and protocol versions.
+A daemon serves one root. The CLI uses `--root DIR` first, then
+`IBX_ROOT`, then the resolved box's parent directory, then the working
+directory if there is no box. On autostart with an inferred root, the CLI
+prints the root and socket path to stderr.
+
+The default socket is `<root>/ibx.sock`. If that path exceeds 107 bytes,
+ibx uses `ibx-<hash>.sock` in an existing `XDG_RUNTIME_DIR` directory
+or in the OS temporary directory (on Linux, `TMPDIR` or `/tmp`). The
+hash is the first 16 hexadecimal characters of the SHA-256 of the
+absolute root path. Set `IBX_SOCKET` to choose an explicit path. If the
+explicit path or the fallback exceeds 107 bytes, set `IBX_SOCKET` to a
+shorter location to fit the Unix `sun_path` limit. The socket mode is
+0600, and both sides verify the peer UID. The socket directory must be
+owned by the daemon user. An automatic fallback can also use a shared
+sticky directory such as `/tmp`.
 
 - `ibx daemon` runs in the foreground. Starting a second daemon on a live
   socket fails. A dead daemon's stale socket is replaced when the next daemon starts.
@@ -34,7 +43,18 @@ UID. Clients and daemons must have matching binary and protocol versions.
   batch input connections may be closed during either operation.
 - `ibx status` prints the daemon version, RFC 3339 start time, box count,
   and job definition count. It exits 1 when stopped and never autostarts.
-  The box count excludes archived boxes. Job execution is planned for stage 3.
+  The box count excludes archived boxes.
+- `ibx --version` and `ibx version` print the client version without
+  contacting a daemon.
+
+Normal commands require matching client and daemon versions and protocol
+versions. On a mismatch, run `ibx daemon restart`. A daemon that supports
+cross-version control drains active work and re-execs with the requesting
+client's binary. `ibx daemon stop` also works across versions with that
+support. Set `IBX_AUTORESTART=1` to restart automatically, verify the new
+daemon's version and retry the original command once. Daemons from before
+cross-version control was introduced must be stopped with their matching
+client before the new version can start.
 
 ## Commands
 
@@ -44,7 +64,11 @@ path containing a slash, and `send` accepts a positional box path. For
 example, `ibx send case/x/box` reads its body from stdin. With `IBX_ROOT` unset, relative box paths resolve
 against the caller's working directory. Common options work before or after
 the command. New directories have mode 0700 and files have mode 0600.
-Existing directory permissions are preserved.
+Existing directory permissions are preserved. With an explicit root
+from `--root` or `IBX_ROOT`, a box supplied by flag, environment or
+positional argument must resolve inside that root. An outside box
+returns exit 2. Configured notification fallback and tee destinations
+can use absolute paths outside the root.
 
 - `put [--id ID] [--max-size BYTES] [BODY | -]` stores a body and prints its id.
   Omitted BODY or `-` reads stdin. Empty bodies are rejected; the default
@@ -160,9 +184,34 @@ owner scans, and skipped by notification. They still accept messages,
 tee copies, scheduled deliveries, and direct commands.
 `ibx unarchive BOX` removes the marker and wakes the sweep.
 
-## Notifications
+## Configuration reference
 
-Configure the daemon in `<root>/ibx.json`:
+Put a JSON object in `<root>/ibx.json`. Duration strings use Go duration
+syntax, with units such as `ms`, `s`, `m`, and `h`.
+
+| Key | JSON type | Default | Meaning |
+| --- | --- | --- | --- |
+| `notify_cmd` | String | Empty | Shell command to run for a notification attempt. Empty disables configured notifications. |
+| `retry_after` | Duration string | `"30s"` | Delay before retrying a command that returned exit 75. |
+| `sweep_after` | Duration string | `"5m"` | Minimum pending-message age for a sweep to start an ordinary notification attempt. |
+| `sweep_every` | Duration string | `"5m"` | Time between sweeps for the box, with a 1 ms minimum. |
+| `fallback` | String | Empty | Absolute or root-relative destination for a failure message. Empty disables forwarding. |
+| `notify_timeout` | Duration string | `"10s"` | Time allowed for a notification command. |
+| `dedupe_ttl` | Duration string | `"0s"` | Maximum age of an existing entry for duplicate suppression. Zero suppresses duplicates for as long as the entry exists. |
+| `keep` | Duration string | `"168h"` | Retention age for completed messages removed by `gc`. Temporary-file retention is fixed at one hour. |
+| `job_path` | Array of strings | `[]` | Directories searched in order for job executables. Relative directories are relative to the root. |
+| `job_env` | Array of strings | `[]` | Names of daemon environment variables to pass to job subprocesses, which also receive `IBX_JOB` and `IBX_BOX`. |
+| `job_timeout` | Duration string | `"30s"` | Maximum runtime for each job execution. Must be positive. |
+| `job_max_output` | Integer | `1048576` | Maximum job stdout in bytes. Exceeding the cap fails the run. Must be positive. |
+| `job_concurrency` | Integer | `4` | Maximum number of jobs running at once. Must be positive. |
+| `boxes` | Object | `{}` | Overrides keyed by root-relative box path. Each value is an object with optional `notify_cmd`, `retry_after`, `sweep_after`, `sweep_every`, `fallback`, and `notify_timeout` fields. Omitted or empty values inherit the root setting. |
+| `tee` | Array of objects | `[]` | Copy rules for arrivals. Each rule has the fields below. |
+
+| Tee field | JSON type | Default | Meaning |
+| --- | --- | --- | --- |
+| `from` | String | Required | Absolute or root-relative source box path. |
+| `to` | String | Required | Destination box path. Can be absolute or root-relative. |
+| `match` | String | Empty | Go regular expression applied to the message body. Empty matches every arrival. |
 
 ```json
 {
@@ -170,12 +219,25 @@ Configure the daemon in `<root>/ibx.json`:
   "retry_after": "30s",
   "sweep_after": "5m",
   "sweep_every": "5m",
+  "fallback": "alerts/box",
   "notify_timeout": "10s",
+  "dedupe_ttl": "24h",
+  "keep": "168h",
+  "job_path": ["bin", "/opt/ibx/jobs"],
+  "job_env": ["LANG", "TZ"],
+  "job_timeout": "30s",
+  "job_max_output": 1048576,
+  "job_concurrency": 4,
   "boxes": {
-    "case/x/box": { "fallback": "alerts/box" }
-  }
+    "case/x/box": {"fallback": "case/x/alerts", "retry_after": "10s"}
+  },
+  "tee": [
+    {"from": "case/x/box", "to": "audit/box", "match": "^build"}
+  ]
 }
 ```
+
+## Notifications
 
 The daemon reads the file at each notification decision. Per-box settings
 override root settings. On `send`, `--notify-cmd` overrides
@@ -390,3 +452,18 @@ go test ./...
 ## License
 
 MIT License. See [LICENSE](LICENSE).
+
+
+## Compatibility with pre-daemon (1.x) clients
+
+Mixing old and new clients on one box is **not a guaranteed
+configuration**. They share file formats and the box lock, so basic
+`put`, `send`, `take`, `list`, and `own` operations interleave without
+corruption in practice. Old clients' sends run outside the daemon's
+notification attempt lock and are invisible to episode, fallback, and
+retry state and to sweeps. Double notification is possible. Scheduled
+delivery, jobs, extended deduplication, and metadata cleanup do not apply
+to old clients.
+
+Use a single version per box. If old clients are unavoidable, restrict
+them to `put`, `take`, and `list`.
